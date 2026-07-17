@@ -165,7 +165,578 @@ def compute_regression_metrics(y_true, y_pred):
                       if len(y_true) > 1 else np.nan,
     }
 
+# ═══════════════════════════════════════════
+# HELPER: Feature selection UI (shared by Classification & Regression)
+# ═══════════════════════════════════════════
+def build_feature_matrix(geno, marker_info, meta, samples_use,
+                           key_prefix="ml"):
+    """
+    Interactive UI for selecting input features:
+      - SNP selection (all / chromosome / MAF / custom)
+      - Optional covariates from metadata
 
+    Returns:
+        X_features (np.ndarray): feature matrix (samples × features)
+        feature_names (list): names of selected features
+        info_msg (str): summary of what was selected
+    """
+    st.markdown("### 🎯 Input Feature Selection")
+
+    # ─── SNP Selection ───
+    st.markdown("#### 🧬 SNP Selection")
+
+    snp_mode = st.radio(
+        "How would you like to select SNPs?",
+        [
+            "All SNPs (default)",
+            "Filter by chromosome",
+            "Filter by MAF (top N%)",
+            "Custom list (paste SNP names)",
+            "None (use only covariates)",
+        ],
+        key=f"{key_prefix}_snp_mode",
+        horizontal=False,
+    )
+
+    selected_snps = []
+    snp_info = ""
+
+    if snp_mode == "All SNPs (default)":
+        selected_snps = geno.columns.tolist()
+        snp_info = f"Using all {len(selected_snps):,} SNPs"
+
+    elif snp_mode == "Filter by chromosome":
+        if marker_info is None or "Chrom" not in marker_info.columns:
+            st.warning("⚠️ Chromosome information not available. Using all SNPs.")
+            selected_snps = geno.columns.tolist()
+            snp_info = f"Using all {len(selected_snps):,} SNPs (chromosome filter unavailable)"
+        else:
+            available_chroms = sorted(marker_info["Chrom"].astype(str).unique())
+            selected_chroms = st.multiselect(
+                "Select chromosomes",
+                available_chroms,
+                default=available_chroms[:min(3, len(available_chroms))],
+                key=f"{key_prefix}_chr_sel",
+            )
+            if selected_chroms:
+                markers_in_chr = marker_info[
+                    marker_info["Chrom"].astype(str).isin(selected_chroms)
+                ]["Marker"].astype(str).tolist()
+                selected_snps = [m for m in geno.columns.astype(str)
+                                   if m in markers_in_chr]
+                snp_info = (f"Using {len(selected_snps):,} SNPs from "
+                             f"{len(selected_chroms)} chromosome(s): "
+                             f"{', '.join(selected_chroms[:5])}"
+                             + ('...' if len(selected_chroms) > 5 else ''))
+            else:
+                selected_snps = []
+                snp_info = "No chromosomes selected"
+
+    elif snp_mode == "Filter by MAF (top N%)":
+        maf_c1, maf_c2 = st.columns(2)
+        with maf_c1:
+            maf_mode = st.selectbox(
+                "MAF filter mode",
+                ["Top N% highest MAF", "MAF above threshold"],
+                key=f"{key_prefix}_maf_mode",
+            )
+        with maf_c2:
+            if maf_mode == "Top N% highest MAF":
+                top_pct = st.slider("Top %", 1, 100, 20, 1,
+                                     key=f"{key_prefix}_top_pct")
+            else:
+                min_maf_thr = st.slider("MAF threshold", 0.0, 0.5, 0.05, 0.01,
+                                          key=f"{key_prefix}_maf_thr")
+
+        with st.spinner("Computing MAF..."):
+            maf_all = calc_maf(geno)
+
+        if maf_mode == "Top N% highest MAF":
+            n_keep = max(1, int(len(maf_all) * top_pct / 100))
+            selected_snps = maf_all.nlargest(n_keep).index.tolist()
+            snp_info = (f"Using top {top_pct}% MAF SNPs = "
+                         f"{len(selected_snps):,} SNPs "
+                         f"(MAF ≥ {maf_all.nlargest(n_keep).min():.4f})")
+        else:
+            selected_snps = maf_all[maf_all >= min_maf_thr].index.tolist()
+            snp_info = (f"Using {len(selected_snps):,} SNPs with "
+                         f"MAF ≥ {min_maf_thr}")
+
+    elif snp_mode == "Custom list (paste SNP names)":
+        snp_text = st.text_area(
+            "Paste SNP names (one per line, or comma-separated)",
+            height=150,
+            key=f"{key_prefix}_snp_text",
+            help="Example:\nSNP_1\nSNP_2\nSNP_3\n\nOr: SNP_1, SNP_2, SNP_3",
+        )
+        if snp_text.strip():
+            # Parse both newline and comma separated
+            raw = snp_text.replace(",", "\n").split("\n")
+            custom_list = [s.strip() for s in raw if s.strip()]
+            # Match against available SNPs
+            available_snps = set(geno.columns.astype(str))
+            matched = [s for s in custom_list if s in available_snps]
+            missing = [s for s in custom_list if s not in available_snps]
+
+            selected_snps = matched
+            snp_info = (f"Matched {len(matched)}/{len(custom_list)} SNPs "
+                         f"from your list")
+
+            if missing:
+                with st.expander(f"⚠️ {len(missing)} SNPs not found"):
+                    st.code("\n".join(missing[:50]) +
+                             ("\n..." if len(missing) > 50 else ""))
+        else:
+            selected_snps = []
+            snp_info = "No SNPs pasted"
+
+    elif snp_mode == "None (use only covariates)":
+        selected_snps = []
+        snp_info = "No SNPs — will use only metadata covariates"
+
+    # Show SNP selection summary
+    if selected_snps:
+        st.success(f"✅ {snp_info}")
+    else:
+        st.info(f"ℹ️ {snp_info}")
+
+    # ─── Covariates from metadata ───
+    st.markdown("#### 📊 Additional Covariates (optional)")
+    st.write(
+        "Add extra numeric variables from metadata as features "
+        "(e.g., environmental variables, age, weight)."
+    )
+
+    selected_covariates = []
+    if meta is not None:
+        # Get numeric columns except sample_id
+        numeric_meta_cols = meta.select_dtypes(include=[np.number]).columns.tolist()
+        if numeric_meta_cols:
+            selected_covariates = st.multiselect(
+                "Select covariates from metadata",
+                numeric_meta_cols,
+                default=[],
+                key=f"{key_prefix}_covariates",
+                help="These will be added to the SNP features as extra columns.",
+            )
+        else:
+            st.info("No numeric columns in metadata for covariates.")
+    else:
+        st.info("No metadata loaded — no covariates available.")
+
+    # ─── Build final feature matrix ───
+    feature_matrices = []
+    feature_names = []
+
+    # Add SNPs
+    if selected_snps:
+        X_snps = geno.loc[samples_use, selected_snps]
+        X_snps_imp = impute_missing(X_snps, "mean").values
+        feature_matrices.append(X_snps_imp)
+        feature_names.extend([str(s) for s in selected_snps])
+
+    # Add covariates
+    if selected_covariates and meta is not None:
+        # Try to find sample column in metadata
+        try:
+            sam_col_local = st.session_state.get(f"{key_prefix}_sam",
+                                                    global_sam_col)
+            if sam_col_local and sam_col_local in meta.columns:
+                cov_map = meta.set_index(meta[sam_col_local].astype(str))[
+                    selected_covariates]
+                # Reindex to match samples_use
+                cov_data = cov_map.reindex([str(s) for s in samples_use])
+                # Impute missing covariates with mean
+                cov_data = cov_data.fillna(cov_data.mean())
+                feature_matrices.append(cov_data.values)
+                feature_names.extend([f"cov_{c}" for c in selected_covariates])
+            else:
+                st.warning("Could not match sample IDs for covariates.")
+        except Exception as e:
+            st.warning(f"Could not add covariates: {e}")
+
+    # Combine
+    if len(feature_matrices) == 0:
+        return None, [], "❌ No features selected"
+
+    X_features = np.hstack(feature_matrices)
+
+    info_msg = (f"📊 **Final feature matrix:** {X_features.shape[0]} samples × "
+                 f"{X_features.shape[1]} features "
+                 f"({len(selected_snps)} SNPs + {len(selected_covariates)} covariates)")
+
+    return X_features, feature_names, info_msg
+
+
+# =========================================================
+# TAB 1 — Classification (with Feature Selection)
+# =========================================================
+with tab_clf:
+    st.subheader("🏷️ Classification: Predict Categorical Target from SNPs")
+
+    if meta is None:
+        st.warning(
+            "⚠️ **Metadata required.** Classification needs a target label "
+            "(e.g., Species, Population, Group)."
+        )
+    else:
+        # ─── Target & Sample ID ───
+        st.markdown("### 🎯 Target Configuration")
+        c1, c2 = st.columns(2)
+        with c1:
+            target_col = st.selectbox(
+                "Target column (categorical label)",
+                meta.columns.tolist(),
+                index=meta.columns.tolist().index(global_pop_col)
+                if global_pop_col in meta.columns.tolist() else 0,
+                key="ml_clf_target",
+            )
+        with c2:
+            sam_col = st.selectbox(
+                "Sample ID column",
+                meta.columns.tolist(),
+                index=meta.columns.tolist().index(global_sam_col)
+                if global_sam_col in meta.columns.tolist() else 0,
+                key="ml_clf_sam",
+            )
+
+        st.markdown("---")
+
+        # ─── Get valid samples first ───
+        pop_map = dict(zip(meta[sam_col].astype(str),
+                            meta[target_col].astype(str)))
+        samples_use = [s for s in geno.index.astype(str)
+                        if s in pop_map and pd.notna(pop_map.get(s))]
+
+        if len(samples_use) < 10:
+            st.error(f"Only {len(samples_use)} samples with valid labels. "
+                      "Need ≥ 10.")
+            st.stop()
+
+        st.info(f"📊 {len(samples_use)} samples with valid target labels")
+
+        # ─── Feature selection UI ───
+        X_use_raw, feature_names, info_msg = build_feature_matrix(
+            geno, marker_info, meta, samples_use, key_prefix="ml_clf"
+        )
+
+        if X_use_raw is None or X_use_raw.shape[1] == 0:
+            st.error("❌ No features selected. Please select SNPs or covariates.")
+            st.stop()
+
+        st.success(info_msg)
+
+        st.markdown("---")
+
+        # ─── Model & Hyperparameters ───
+        st.markdown("### 🤖 Model Selection")
+        method = st.selectbox(
+            "Classifier",
+            ["Random Forest", "Logistic Regression", "SVM",
+             "XGBoost", "Gradient Boosting"],
+            key="ml_clf_method",
+        )
+
+        st.markdown("#### 🔧 Hyperparameters")
+        rf_n, rf_d = 100, None
+        if method == "Random Forest":
+            hc1, hc2 = st.columns(2)
+            with hc1:
+                rf_n = st.slider("N estimators", 10, 500, 100, 10, key="ml_rf_n")
+            with hc2:
+                rf_d = st.selectbox("Max depth", [None, 5, 10, 15, 20],
+                                     key="ml_rf_d")
+
+        lr_C = 1.0
+        if method == "Logistic Regression":
+            lr_C = st.slider("Regularization C", 0.01, 10.0, 1.0, 0.01,
+                              key="ml_lr_c")
+
+        svm_C, svm_k = 1.0, "rbf"
+        if method == "SVM":
+            hc1, hc2 = st.columns(2)
+            with hc1:
+                svm_C = st.slider("C", 0.01, 10.0, 1.0, 0.01, key="ml_svm_c")
+            with hc2:
+                svm_k = st.selectbox("Kernel", ["rbf", "linear", "poly"],
+                                      key="ml_svm_k")
+
+        xgb_lr, xgb_n, xgb_d = 0.1, 100, 6
+        if method == "XGBoost":
+            hc1, hc2, hc3 = st.columns(3)
+            with hc1:
+                xgb_lr = st.slider("Learning rate", 0.01, 0.5, 0.1, 0.01,
+                                    key="ml_xgb_lr")
+            with hc2:
+                xgb_n = st.slider("N estimators", 10, 500, 100, 10,
+                                   key="ml_xgb_n")
+            with hc3:
+                xgb_d = st.slider("Max depth", 2, 15, 6, key="ml_xgb_d")
+
+        st.markdown("#### ⚙️ Preprocessing & CV")
+        pp1, pp2 = st.columns(2)
+        with pp1:
+            use_pca_clf = st.checkbox(
+                "PCA pre-reduction (recommended if many features)",
+                False, key="ml_use_pca")
+        with pp2:
+            n_pcs_clf = None
+            if use_pca_clf:
+                max_pcs = min(X_use_raw.shape[0], X_use_raw.shape[1])
+                n_pcs_clf = st.slider("N PCs", 2, min(50, max_pcs),
+                                        min(20, max_pcs), key="ml_npcs")
+
+        c3, c4, c5 = st.columns(3)
+        with c3:
+            test_sz = st.slider("Test size (%)", 10, 50, 20, 5,
+                                 key="ml_ts") / 100
+        with c4:
+            rs = int(st.number_input("Random state", value=42, key="ml_rs"))
+        with c5:
+            cv_k = st.slider("CV folds", 2, 10, 5, key="ml_cv")
+
+        # ─── Run ───
+        if st.button("🚀 Train & Evaluate Classifier",
+                     use_container_width=True, key="ml_clf_run"):
+            y_raw = np.array([pop_map[s] for s in samples_use])
+
+            # Scale features
+            X_scaled = StandardScaler().fit_transform(X_use_raw)
+
+            # Optional PCA
+            if use_pca_clf:
+                pca_pre = PCA(n_components=min(n_pcs_clf, X_scaled.shape[1],
+                                                  X_scaled.shape[0]))
+                X_use = pca_pre.fit_transform(X_scaled)
+                final_feat_names = [f"PC{i+1}" for i in range(X_use.shape[1])]
+            else:
+                X_use = X_scaled
+                final_feat_names = feature_names
+
+            le = LabelEncoder()
+            y = le.fit_transform(y_raw)
+            cnames = le.classes_.astype(str)
+            nc = len(cnames)
+
+            # Class distribution
+            st.markdown("#### 📊 Class Distribution")
+            class_dist = pd.Series(y_raw).value_counts().reset_index()
+            class_dist.columns = ["Class", "Count"]
+            fig_dist = px.bar(class_dist, x="Class", y="Count",
+                                color="Class", text="Count",
+                                title="Sample count per class")
+            fig_dist.update_traces(textposition="outside")
+            fig_dist.update_layout(template="plotly_white", height=400,
+                                     showlegend=False)
+            st.plotly_chart(fig_dist, use_container_width=True)
+
+            # Train/test split
+            try:
+                X_tr, X_te, y_tr, y_te = train_test_split(
+                    X_use, y, test_size=test_sz,
+                    random_state=rs, stratify=y,
+                )
+            except ValueError:
+                st.warning("Stratification failed. Using random split.")
+                X_tr, X_te, y_tr, y_te = train_test_split(
+                    X_use, y, test_size=test_sz, random_state=rs,
+                )
+
+            st.info(f"📊 **Split**: {len(X_tr)} training + {len(X_te)} test samples")
+
+            # Build model
+            if method == "Random Forest":
+                model = RandomForestClassifier(n_estimators=rf_n, max_depth=rf_d,
+                                                  random_state=rs, n_jobs=-1)
+            elif method == "Logistic Regression":
+                model = LogisticRegression(C=lr_C, max_iter=2000, random_state=rs)
+            elif method == "SVM":
+                model = SVC(C=svm_C, kernel=svm_k, probability=True,
+                             random_state=rs)
+            elif method == "Gradient Boosting":
+                model = GradientBoostingClassifier(random_state=rs)
+            elif method == "XGBoost":
+                try:
+                    from xgboost import XGBClassifier
+                    model = XGBClassifier(
+                        learning_rate=xgb_lr, n_estimators=xgb_n,
+                        max_depth=xgb_d, random_state=rs, n_jobs=-1,
+                        verbosity=0, use_label_encoder=False,
+                        eval_metric="mlogloss" if nc > 2 else "logloss")
+                except ImportError:
+                    st.error("XGBoost not installed.")
+                    st.stop()
+
+            with st.spinner(f"Training {method}..."):
+                model.fit(X_tr, y_tr)
+                y_pr = model.predict(X_te)
+                try:
+                    y_pp = model.predict_proba(X_te)
+                except Exception:
+                    y_pp = None
+
+                test_metrics = compute_classification_metrics(
+                    y_te, y_pr, y_pp, cnames)
+
+                skf = StratifiedKFold(n_splits=cv_k, shuffle=True,
+                                        random_state=rs)
+                scoring = ["accuracy", "precision_weighted",
+                            "recall_weighted", "f1_weighted"]
+                cv_results = cross_validate(model, X_use, y, cv=skf,
+                                              scoring=scoring, n_jobs=-1)
+
+            st.success(f"✅ {method} trained successfully.")
+
+            # Test metrics
+            st.markdown("### 📊 Test Set Metrics")
+            n_metrics = len(test_metrics)
+            n_cols = min(4, n_metrics)
+            rows_needed = (n_metrics + n_cols - 1) // n_cols
+
+            metric_items = list(test_metrics.items())
+            for row_i in range(rows_needed):
+                cols = st.columns(n_cols)
+                for col_i in range(n_cols):
+                    idx = row_i * n_cols + col_i
+                    if idx < n_metrics:
+                        name, val = metric_items[idx]
+                        cols[col_i].metric(name, f"{val:.4f}")
+
+            # CV Results
+            st.markdown(f"### 🔄 {cv_k}-Fold Cross-Validation Results")
+            cv_summary = pd.DataFrame({
+                "Metric": ["Accuracy", "Precision (weighted)",
+                            "Recall (weighted)", "F1 (weighted)"],
+                "Mean": [
+                    cv_results["test_accuracy"].mean(),
+                    cv_results["test_precision_weighted"].mean(),
+                    cv_results["test_recall_weighted"].mean(),
+                    cv_results["test_f1_weighted"].mean(),
+                ],
+                "Std": [
+                    cv_results["test_accuracy"].std(),
+                    cv_results["test_precision_weighted"].std(),
+                    cv_results["test_recall_weighted"].std(),
+                    cv_results["test_f1_weighted"].std(),
+                ],
+                "Min": [
+                    cv_results["test_accuracy"].min(),
+                    cv_results["test_precision_weighted"].min(),
+                    cv_results["test_recall_weighted"].min(),
+                    cv_results["test_f1_weighted"].min(),
+                ],
+                "Max": [
+                    cv_results["test_accuracy"].max(),
+                    cv_results["test_precision_weighted"].max(),
+                    cv_results["test_recall_weighted"].max(),
+                    cv_results["test_f1_weighted"].max(),
+                ],
+            })
+            st.dataframe(cv_summary.style.format({
+                c: "{:.4f}" for c in ["Mean", "Std", "Min", "Max"]
+            }), use_container_width=True)
+
+            # CV fold plot
+            fig_cv = go.Figure()
+            fig_cv.add_trace(go.Box(y=cv_results["test_accuracy"],
+                                        name="Accuracy",
+                                        marker_color="steelblue"))
+            fig_cv.add_trace(go.Box(y=cv_results["test_f1_weighted"],
+                                        name="F1",
+                                        marker_color="orange"))
+            fig_cv.add_trace(go.Box(y=cv_results["test_precision_weighted"],
+                                        name="Precision",
+                                        marker_color="green"))
+            fig_cv.add_trace(go.Box(y=cv_results["test_recall_weighted"],
+                                        name="Recall",
+                                        marker_color="purple"))
+            fig_cv.update_layout(
+                title=f"Cross-validation scores ({cv_k} folds)",
+                yaxis_title="Score", template="plotly_white", height=450,
+            )
+            st.plotly_chart(fig_cv, use_container_width=True)
+
+            # Classification report
+            st.markdown("### 📝 Detailed Classification Report")
+            rpt = classification_report(y_te, y_pr, target_names=cnames,
+                                          output_dict=True)
+            st.dataframe(pd.DataFrame(rpt).T.style.format("{:.4f}"),
+                          use_container_width=True)
+
+            # Confusion matrix
+            st.markdown("### 🔀 Confusion Matrix")
+            cm = confusion_matrix(y_te, y_pr)
+            fig_cm = px.imshow(cm, x=cnames, y=cnames, text_auto=True,
+                                color_continuous_scale="Blues",
+                                title="Confusion Matrix (Test Set)",
+                                labels=dict(x="Predicted", y="Actual"))
+            fig_cm.update_layout(template="plotly_white", height=500)
+            st.plotly_chart(fig_cm, use_container_width=True)
+
+            cm_norm = cm.astype("float") / cm.sum(axis=1, keepdims=True)
+            fig_cm_n = px.imshow(cm_norm, x=cnames, y=cnames,
+                                    text_auto=".2f",
+                                    color_continuous_scale="Blues",
+                                    title="Normalized Confusion Matrix",
+                                    labels=dict(x="Predicted", y="Actual",
+                                                color="Proportion"))
+            fig_cm_n.update_layout(template="plotly_white", height=500)
+            st.plotly_chart(fig_cm_n, use_container_width=True)
+
+            # ROC Curve
+            if y_pp is not None:
+                st.markdown("### 📈 ROC Curve")
+                fig_roc = go.Figure()
+                if nc == 2:
+                    fpr, tpr, _ = roc_curve(y_te, y_pp[:, 1])
+                    fig_roc.add_trace(go.Scatter(
+                        x=fpr, y=tpr, mode="lines",
+                        name=f"AUC={auc(fpr, tpr):.4f}",
+                        line=dict(color="steelblue", width=2)))
+                else:
+                    for i, cn in enumerate(cnames):
+                        yb = (y_te == i).astype(int)
+                        if yb.sum() == 0:
+                            continue
+                        fpr, tpr, _ = roc_curve(yb, y_pp[:, i])
+                        fig_roc.add_trace(go.Scatter(
+                            x=fpr, y=tpr, mode="lines",
+                            name=f"{cn} AUC={auc(fpr, tpr):.4f}"))
+                fig_roc.add_trace(go.Scatter(
+                    x=[0, 1], y=[0, 1], mode="lines",
+                    line=dict(dash="dash", color="gray"), name="Random"))
+                fig_roc.update_layout(
+                    xaxis_title="False Positive Rate",
+                    yaxis_title="True Positive Rate",
+                    template="plotly_white", height=500,
+                    title="ROC Curves (Test Set)")
+                st.plotly_chart(fig_roc, use_container_width=True)
+
+            # Feature Importance
+            if method in ["Random Forest", "XGBoost", "Gradient Boosting"]:
+                st.markdown("### 🎯 Feature Importance (top 30)")
+                imp = pd.DataFrame({
+                    "Feature": final_feat_names,
+                    "Importance": model.feature_importances_,
+                }).sort_values("Importance", ascending=False).head(30)
+
+                fig_imp = px.bar(imp, x="Importance", y="Feature",
+                                  orientation="h", color="Importance",
+                                  color_continuous_scale="viridis",
+                                  title="Top 30 features")
+                fig_imp.update_layout(template="plotly_white", height=650,
+                                         yaxis=dict(autorange="reversed"))
+                st.plotly_chart(fig_imp, use_container_width=True)
+                download_dataframe(imp, "feature_importance.csv",
+                                    key="dl_ml_imp")
+
+            # Save metrics
+            metrics_df = pd.DataFrame({
+                "Metric": list(test_metrics.keys()),
+                "Value": list(test_metrics.values()),
+            })
+            download_dataframe(metrics_df, "classification_metrics.csv",
+                                key="dl_clf_metrics")
 # =========================================================
 # TAB 1 — Classification (Enhanced)
 # =========================================================
@@ -514,13 +1085,14 @@ with tab_clf:
                                 key="dl_clf_metrics")
 
 # =========================================================
-# TAB 2 — REGRESSION (NEW! Comprehensive)
+# TAB 2 — REGRESSION (with Feature Selection)
 # =========================================================
 with tab_reg:
     st.subheader("📈 Regression: Predict Continuous Trait from SNPs")
     st.write(
         "Multiple regression algorithms to predict quantitative traits "
-        "(e.g., yield, height, disease resistance) from SNP genotypes."
+        "(e.g., yield, height, disease resistance) from SNP genotypes and "
+        "optional covariates."
     )
 
     if meta is None:
@@ -529,6 +1101,8 @@ with tab_reg:
             "(e.g., yield, height, biomass, disease score)."
         )
     else:
+        # ─── Target & Sample ID ───
+        st.markdown("### 🎯 Target Configuration")
         rc1, rc2 = st.columns(2)
         with rc1:
             numeric_cols = meta.select_dtypes(include=[np.number]).columns.tolist()
@@ -549,8 +1123,65 @@ with tab_reg:
                 key="ml_reg_sam",
             )
 
+        st.markdown("---")
+
+        # ─── Get valid samples first ───
+        trait_map = dict(zip(meta[sam_reg].astype(str),
+                               meta[target_reg]))
+        samples_use = []
+        y_list = []
+        for s in geno.index.astype(str):
+            if s in trait_map:
+                val = trait_map[s]
+                if pd.notna(val):
+                    try:
+                        y_list.append(float(val))
+                        samples_use.append(s)
+                    except (ValueError, TypeError):
+                        pass
+
+        if len(samples_use) < 10:
+            st.error(f"Only {len(samples_use)} samples with valid target "
+                      "values. Need ≥ 10.")
+            st.stop()
+
+        y = np.array(y_list)
+
+        st.info(f"📊 {len(samples_use)} samples with valid target values "
+                 f"(mean={y.mean():.2f}, std={y.std():.2f})")
+
+        # ─── Feature selection UI ───
+        # Note: exclude target column from potential covariates
+        meta_for_cov = meta.copy()
+        if target_reg in meta_for_cov.columns:
+            # Warn if target might be selected as covariate
+            pass
+
+        X_use_raw, feature_names, info_msg = build_feature_matrix(
+            geno, marker_info, meta, samples_use, key_prefix="ml_reg"
+        )
+
+        if X_use_raw is None or X_use_raw.shape[1] == 0:
+            st.error("❌ No features selected. Please select SNPs or covariates.")
+            st.stop()
+
+        # Warn if target is in covariates
+        if any(f == f"cov_{target_reg}" for f in feature_names):
+            st.error(
+                f"⚠️ **Warning:** The target trait '{target_reg}' is also "
+                f"selected as a covariate! This will cause data leakage. "
+                f"Please deselect it from covariates."
+            )
+            st.stop()
+
+        st.success(info_msg)
+
+        st.markdown("---")
+
+        # ─── Model & Hyperparameters ───
+        st.markdown("### 🤖 Regression Algorithm")
         method_reg = st.selectbox(
-            "Regression Algorithm",
+            "Algorithm",
             [
                 "Linear Regression (OLS)",
                 "Ridge Regression (L2)",
@@ -613,7 +1244,7 @@ with tab_reg:
                     en_l1 = st.slider("L1 ratio", 0.0, 1.0, 0.5, 0.05,
                                        key="ml_en_l1")
 
-        # Random Forest / Gradient Boosting
+        # Random Forest
         rf_n_reg, rf_d_reg = 100, None
         if method_reg == "Random Forest":
             hrc1, hrc2 = st.columns(2)
@@ -625,6 +1256,7 @@ with tab_reg:
                                           [None, 5, 10, 15, 20],
                                           key="ml_rf_reg_d")
 
+        # Gradient Boosting
         gb_n_reg, gb_lr = 100, 0.1
         if method_reg == "Gradient Boosting":
             hgc1, hgc2 = st.columns(2)
@@ -662,13 +1294,20 @@ with tab_reg:
                 svr_eps = st.slider("Epsilon", 0.001, 1.0, 0.1, 0.01,
                                       key="ml_svr_eps")
 
-        # ─── Data Splitting & CV ───
-        st.markdown("#### ⚙️ Data Splitting & Cross-Validation")
+        # ─── Preprocessing & CV ───
+        st.markdown("#### ⚙️ Preprocessing & Cross-Validation")
 
-        use_pca_reg = st.checkbox("PCA pre-reduction (recommended for many markers)",
-                                    True, key="ml_reg_pca")
-        n_pcs_reg = st.slider("N PCs", 2, 50, 20,
-                                key="ml_reg_npcs") if use_pca_reg else None
+        pp1, pp2 = st.columns(2)
+        with pp1:
+            use_pca_reg = st.checkbox(
+                "PCA pre-reduction (recommended if many features)",
+                False, key="ml_reg_pca")
+        with pp2:
+            n_pcs_reg = None
+            if use_pca_reg:
+                max_pcs = min(X_use_raw.shape[0], X_use_raw.shape[1])
+                n_pcs_reg = st.slider("N PCs", 2, min(50, max_pcs),
+                                       min(20, max_pcs), key="ml_reg_npcs")
 
         rc3, rc4, rc5 = st.columns(3)
         with rc3:
@@ -680,42 +1319,23 @@ with tab_reg:
         with rc5:
             cv_k_reg = st.slider("CV folds", 2, 10, 5, key="ml_reg_cv")
 
+        # ─── Run ───
         if st.button("🚀 Train & Evaluate Regression Model",
                      use_container_width=True, key="ml_reg_run"):
 
-            # Prepare data
-            trait_map = dict(zip(meta[sam_reg].astype(str),
-                                   meta[target_reg]))
-            samples_use = []
-            y_list = []
-            for s in geno.index.astype(str):
-                if s in trait_map:
-                    val = trait_map[s]
-                    if pd.notna(val):
-                        try:
-                            y_list.append(float(val))
-                            samples_use.append(s)
-                        except (ValueError, TypeError):
-                            pass
+            # Scale features
+            X_scaled = StandardScaler().fit_transform(X_use_raw)
 
-            if len(samples_use) < 10:
-                st.error(f"Only {len(samples_use)} samples with valid target "
-                          "values. Need ≥ 10.")
-                st.stop()
-
-            X_raw = geno.loc[samples_use]
-            y = np.array(y_list)
-
-            X_imp = impute_missing(X_raw, "mean").values
-            X_scaled = StandardScaler().fit_transform(X_imp)
-
+            # Optional PCA
             if use_pca_reg:
                 pca_pre = PCA(n_components=min(n_pcs_reg,
                                                   X_scaled.shape[1],
                                                   X_scaled.shape[0]))
                 X_use = pca_pre.fit_transform(X_scaled)
+                final_feat_names = [f"PC{i+1}" for i in range(X_use.shape[1])]
             else:
                 X_use = X_scaled
+                final_feat_names = feature_names
 
             # Target distribution
             st.markdown("#### 📊 Target Trait Distribution")
@@ -805,11 +1425,9 @@ with tab_reg:
                 y_pr_tr = model_reg.predict(X_tr)
                 y_pr_te = model_reg.predict(X_te)
 
-                # Test metrics
                 test_metrics_reg = compute_regression_metrics(y_te, y_pr_te)
                 train_metrics_reg = compute_regression_metrics(y_tr, y_pr_tr)
 
-                # Cross-validation
                 kf = KFold(n_splits=cv_k_reg, shuffle=True,
                             random_state=rs_reg)
                 scoring_reg = ["r2", "neg_root_mean_squared_error",
@@ -821,7 +1439,7 @@ with tab_reg:
 
             st.success(f"✅ {method_reg} trained successfully.")
 
-            # ─── Auto-selected alpha (if applicable) ───
+            # Auto-selected alpha
             if method_reg == "Ridge Regression (L2)" and ridge_cv:
                 st.info(f"🎯 Auto-selected α = {model_reg.alpha_:.6f}")
             elif method_reg == "Lasso Regression (L1)" and lasso_cv:
@@ -830,7 +1448,7 @@ with tab_reg:
                 st.info(f"🎯 Auto-selected α = {model_reg.alpha_:.6f}, "
                          f"L1 ratio = {model_reg.l1_ratio_:.3f}")
 
-            # ─── Test Metrics ───
+            # Test Metrics
             st.markdown("### 📊 Test Set Performance")
             metric_items_reg = list(test_metrics_reg.items())
             n_metrics_reg = len(metric_items_reg)
@@ -847,7 +1465,7 @@ with tab_reg:
                                             f"{val:.4f}"
                                             if not np.isnan(val) else "N/A")
 
-            # ─── Train vs Test comparison ───
+            # Train vs Test comparison
             st.markdown("### 📊 Train vs Test Metrics")
             comparison_df = pd.DataFrame({
                 "Metric": list(test_metrics_reg.keys()),
@@ -860,7 +1478,7 @@ with tab_reg:
                 "Train": "{:.4f}", "Test": "{:.4f}", "Overfitting": "{:.4f}",
             }), use_container_width=True)
 
-            # ─── Cross-Validation Results ───
+            # CV Results
             st.markdown(f"### 🔄 {cv_k_reg}-Fold Cross-Validation")
             cv_summary_reg = pd.DataFrame({
                 "Metric": ["R²", "RMSE", "MAE", "Explained Variance"],
@@ -911,7 +1529,7 @@ with tab_reg:
             )
             st.plotly_chart(fig_cv_reg, use_container_width=True)
 
-            # ─── Actual vs Predicted ───
+            # Actual vs Predicted
             st.markdown("### 📈 Actual vs Predicted")
 
             av_df = pd.DataFrame({
@@ -927,7 +1545,6 @@ with tab_reg:
                 title=f"Actual vs Predicted {target_reg}",
                 hover_data=["Set"],
             )
-            # Add y=x line
             min_val = min(y.min(), av_df["Predicted"].min())
             max_val = max(y.max(), av_df["Predicted"].max())
             fig_av.add_shape(
@@ -941,7 +1558,7 @@ with tab_reg:
             fig_av.update_layout(template="plotly_white", height=550)
             st.plotly_chart(fig_av, use_container_width=True)
 
-            # ─── Residual Analysis ───
+            # Residual Analysis
             st.markdown("### 📉 Residual Analysis (Test Set)")
 
             residuals = y_te - y_pr_te
@@ -949,7 +1566,6 @@ with tab_reg:
             res_c1, res_c2 = st.columns(2)
 
             with res_c1:
-                # Residuals vs Predicted
                 fig_res = px.scatter(
                     x=y_pr_te, y=residuals,
                     labels={"x": "Predicted", "y": "Residuals"},
@@ -962,7 +1578,6 @@ with tab_reg:
                 st.plotly_chart(fig_res, use_container_width=True)
 
             with res_c2:
-                # Residual distribution
                 fig_res_dist = px.histogram(
                     x=residuals, nbins=30,
                     title="Residual distribution",
@@ -972,7 +1587,7 @@ with tab_reg:
                 fig_res_dist.update_layout(template="plotly_white", height=400)
                 st.plotly_chart(fig_res_dist, use_container_width=True)
 
-            # Q-Q plot of residuals
+            # Q-Q plot
             st.markdown("#### Q-Q Plot of Residuals (Normality Check)")
             try:
                 qq_data = probplot(residuals, dist="norm")
@@ -1012,7 +1627,7 @@ with tab_reg:
             except Exception as e:
                 st.warning(f"Could not generate Q-Q plot: {e}")
 
-            # ─── Learning Curve ───
+            # Learning Curve
             st.markdown("### 📚 Learning Curve")
             with st.spinner("Computing learning curve..."):
                 try:
@@ -1051,14 +1666,11 @@ with tab_reg:
                 except Exception as e:
                     st.warning(f"Learning curve failed: {e}")
 
-            # ─── Feature Importance / Coefficients ───
+            # Feature Importance / Coefficients
             if method_reg in ["Random Forest", "Gradient Boosting", "XGBoost"]:
                 st.markdown("### 🎯 Feature Importance (top 30)")
-                feat_names = ([f"PC{i+1}" for i in range(X_use.shape[1])]
-                                if use_pca_reg
-                                else geno.columns.astype(str).tolist())
                 imp_reg = pd.DataFrame({
-                    "Feature": feat_names,
+                    "Feature": final_feat_names,
                     "Importance": model_reg.feature_importances_,
                 }).sort_values("Importance", ascending=False).head(30)
 
@@ -1077,11 +1689,8 @@ with tab_reg:
             elif method_reg in ["Linear Regression (OLS)", "Ridge Regression (L2)",
                                   "Lasso Regression (L1)", "ElasticNet (L1 + L2)"]:
                 st.markdown("### 🎯 Regression Coefficients (top 30 by |coefficient|)")
-                feat_names = ([f"PC{i+1}" for i in range(X_use.shape[1])]
-                                if use_pca_reg
-                                else geno.columns.astype(str).tolist())
                 coef_df = pd.DataFrame({
-                    "Feature": feat_names,
+                    "Feature": final_feat_names,
                     "Coefficient": model_reg.coef_,
                     "Abs_Coef": np.abs(model_reg.coef_),
                 }).sort_values("Abs_Coef", ascending=False).head(30)
@@ -1096,7 +1705,6 @@ with tab_reg:
                                           yaxis=dict(autorange="reversed"))
                 st.plotly_chart(fig_coef, use_container_width=True)
 
-                # For Lasso/ElasticNet: count of non-zero coefs
                 if method_reg in ["Lasso Regression (L1)",
                                     "ElasticNet (L1 + L2)"]:
                     n_nonzero = int(np.sum(np.abs(model_reg.coef_) > 1e-8))
@@ -1107,7 +1715,7 @@ with tab_reg:
                 download_dataframe(coef_df, "regression_coefficients.csv",
                                     key="dl_reg_coef")
 
-            # ─── Predictions download ───
+            # Predictions download
             st.markdown("### 💾 Download Predictions")
             predictions_df = pd.DataFrame({
                 "Sample": samples_use,
@@ -1123,7 +1731,7 @@ with tab_reg:
             download_dataframe(predictions_df, "regression_predictions.csv",
                                 key="dl_reg_preds")
 
-            # ─── Save metrics ───
+            # Save metrics
             metrics_reg_df = pd.DataFrame({
                 "Metric": list(test_metrics_reg.keys()),
                 "Test_Value": list(test_metrics_reg.values()),
@@ -1131,7 +1739,6 @@ with tab_reg:
             })
             download_dataframe(metrics_reg_df, "regression_metrics.csv",
                                 key="dl_reg_metrics")
-
 
 # =========================================================
 # TAB 3 — Feature Selection (Enhanced)
